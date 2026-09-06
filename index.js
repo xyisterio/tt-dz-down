@@ -346,20 +346,6 @@ function buildQualityKeyboard() {
   return { inline_keyboard: rows };
 }
 
-// Оценка размера файла по длительности трека и битрейту выбранного формата.
-// Если длительность неизвестна — считаем трек "большим" на всякий случай
-// (безопаснее скачать самим, чем пытаться отдать Telegram ссылку и словить
-// молчаливый таймаут на слишком большом файле).
-function estimateTrackBytes(durationSeconds, format) {
-  if (!durationSeconds) return Infinity;
-  const kbps = DEEZER_FORMAT_BITRATE_KBPS[format] || DEEZER_FORMAT_BITRATE_KBPS.MP3_320;
-  return Math.round(((kbps * 1000) / 8) * durationSeconds);
-}
-
-function chooseDeezerRoute(durationSeconds, format) {
-  return estimateTrackBytes(durationSeconds, format) <= TELEGRAM_URL_FETCH_LIMIT_BYTES ? "url" : "big";
-}
-
 // ---- Deezer: резолв ссылки, поиск, метаданные, скачивание через dzmedia ----
 
 // Короткие share-ссылки (deezer.page.link/…) редиректят на обычный
@@ -423,23 +409,22 @@ function buildDeezerParams(meta, format, extra = {}) {
 }
 
 // /stream (в отличие от /download) сначала проверяет прогретый CDN-кэш и умеет
-// отдавать файл потоком с поддержкой Range. Используется только для
-// подстраховочного локального скачивания (downloadDeezerTrack) — туда,
-// где нужна отдача частями, а не для прямой ссылки для Telegram (см.
-// buildDeezerDownloadUrl ниже).
+// отдавать файл потоком с поддержкой Range — используется только внутренним
+// фоллбэком (downloadDeezerTrack/sendDeezerTrackLocally), никогда как ссылка
+// напрямую для Telegram: dzmedia специально не торчит наружу (слушает только
+// 127.0.0.1:8080 внутри этого же контейнера, см. entrypoint.sh и
+// .env.example) — такая ссылка для Telegram в принципе недостижима. Плюс это
+// архитектурно и не нужно: /stream/download несут ARL (сессионную куку
+// Deezer-аккаунта) в query-параметрах, и если бы dzmedia был доступен
+// снаружи, эта ARL улетала бы прямо в URL, который видит Telegram. Поэтому
+// трек всегда доставляется через sendBigDeezerTrack: dzmedia сам скачивает,
+// расшифровывает и грузит в Telegram своим BOT_TOKEN (ARL наружу не уходит),
+// а при неудаче — бот подстраховывается и качает готовый расшифрованный
+// поток по этой internal-ссылке сам.
 function buildDeezerStreamUrl(meta, format) {
   return `${DEEZER_API_URL}/stream?${buildDeezerParams(meta, format).toString()}`;
 }
 
-// /download отдаёт уже полностью расшифрованный файл одним ответом — сразу
-// с правильным Content-Type (audio/mpeg или audio/flac, определяется по
-// магическим байтам после расшифровки, а не пробрасывается от CDN как в
-// /stream) и точным Content-Length. Именно этого и ждёт Telegram, когда мы
-// даём ему ссылку и просим скачать самому — так же было устроено на
-// HuggingFace-сервере, откуда это и звалось без проблем.
-function buildDeezerDownloadUrl(meta, format) {
-  return `${DEEZER_API_URL}/download?${buildDeezerParams(meta, format).toString()}`;
-}
 
 // Просит dzmedia заранее резолвнуть и закэшировать CDN-ссылку (см. /warm на
 // сервере), пока пользователь ещё выбирает канал — чтобы к моменту, когда
@@ -546,24 +531,13 @@ async function sendBigDeezerTrack(meta, format, targetChatId) {
 // после того, как канал выбран.
 async function offerDeezerTrack(ctx, meta, statusMsg) {
   const format = getDeezerFormat();
-  const route = chooseDeezerRoute(meta.duration, format);
 
   await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
 
-  if (route === "url") {
-    // /download не смотрит в кэш /warm (он только для /stream) и резолвит
-    // CDN-ссылку заново при каждом запросе — но /stream всё ещё в деле как
-    // локальный фоллбэк (downloadDeezerTrack), если Telegram не осилит
-    // /download-ссылку сам. Поэтому греем кэш заранее — на случай фоллбэка.
-    warmDeezerTrack(meta, format);
-    await offerChannelChoice(ctx, {
-      kind: "audio-url",
-      url: buildDeezerDownloadUrl(meta, format),
-      meta,
-      format,
-    });
-    return;
-  }
+  // Греем кэш CDN-ссылки на всякий случай, пока пользователь выбирает канал —
+  // если sendBigDeezerTrack не сработает и придётся идти через фоллбэк
+  // (downloadDeezerTrack, использует /stream), кэш уже будет тёплым.
+  warmDeezerTrack(meta, format);
 
   await offerChannelChoice(ctx, {
     kind: "audio-big",
