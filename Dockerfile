@@ -10,9 +10,13 @@ FROM node:20-slim
 ADD https://pypi.org/pypi/yt-dlp/json /tmp/yt-dlp-version.json
 
 # yt-dlp — питоновский, ffmpeg нужен ему для склейки видео+аудио дорожек.
+# curl-cffi отдельно — TikTok теперь на part проверок гоняет
+# browser-impersonation (TLS/JA3-отпечаток), самим yt-dlp без него
+# challenge не пройти: без curl_cffi будет падать с "Unexpected response
+# from webpage request", даже на самой свежей версии yt-dlp.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip ffmpeg ca-certificates curl \
-    && pip3 install --no-cache-dir --break-system-packages -U yt-dlp \
+    && pip3 install --no-cache-dir --break-system-packages -U "yt-dlp[default,curl-cffi]" \
     && apt-get purge -y curl \
     && rm -rf /var/lib/apt/lists/*
 
