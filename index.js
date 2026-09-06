@@ -138,13 +138,30 @@ function extractForwardedChannel(msg) {
 const TELEGRAM_URL_FETCH_LIMIT_BYTES = 20 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
-// ---- Скачивание с TikTok через yt-dlp ----
+// ---- Скачивание с TikTok: tikwm.com (без вотемарки, свой CDN) + yt-dlp как фолбэк ----
 
 const TIKTOK_URL_REGEX = /https?:\/\/(?:www\.|vt\.|vm\.|m\.)?tiktok\.com\/\S+/i;
 
-// Быстрый режим без скачивания: просим yt-dlp только распарсить страницу и
-// отдать прямой URL на видео + (если TikTok его прислал) размер файла.
-async function getTikTokDirectInfo(url) {
+// tikwm.com — бесплатный резолвер без ключа: отдаёт ссылки на СВОЁМ CDN, а не
+// на прямом CDN TikTok, поэтому Telegram может их скачать без Referer/UA,
+// которые TikTok иначе требует. hdplay/play — БЕЗ вотемарки (HD и SD
+// соответственно), wmplay — с вотемаркой, её никогда не берём.
+async function getTikTokDirectInfoTikwm(url) {
+  const res = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`, {
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`tikwm ответил ${res.status}`);
+  const json = await res.json();
+  if (json.code !== 0 || !json.data) throw new Error(json.msg || "tikwm: пустой ответ");
+  const data = json.data;
+  const directUrl = data.hdplay || data.play;
+  if (!directUrl) throw new Error("tikwm: нет ссылки без вотемарки для этого видео");
+  const filesize = (data.hdplay ? data.hd_size : data.size) || null;
+  return { directUrl, filesize };
+}
+
+// yt-dlp как запасной резолвер, если tikwm недоступен/не смог разобрать ссылку.
+async function getTikTokDirectInfoYtDlp(url) {
   return new Promise((resolve, reject) => {
     const proc = spawn("yt-dlp", ["--no-playlist", "--no-warnings", "-j", url]);
     let stdout = "";
@@ -171,7 +188,27 @@ async function getTikTokDirectInfo(url) {
   });
 }
 
-async function downloadTikTok(url, destDir) {
+// Быстрый режим без скачивания: сначала tikwm (без вотемарки, свой CDN —
+// Telegram скачает по ссылке без проблем), при ошибке — yt-dlp.
+async function getTikTokDirectInfo(url) {
+  try {
+    return await getTikTokDirectInfoTikwm(url);
+  } catch (err) {
+    console.warn("tikwm не смог разобрать ссылку, пробую yt-dlp:", err.message || err);
+    return getTikTokDirectInfoYtDlp(url);
+  }
+}
+
+// Качает файл по уже известной прямой ссылке (tikwm) — без запуска yt-dlp.
+async function downloadFromUrl(directUrl, destPath) {
+  const res = await fetch(directUrl, { signal: AbortSignal.timeout(120_000) });
+  if (!res.ok) throw new Error(`скачивание по прямой ссылке: ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  await writeFile(destPath, buf);
+  return destPath;
+}
+
+async function downloadTikTokYtDlp(url, destDir) {
   const outputTemplate = path.join(destDir, "video.%(ext)s");
   return new Promise((resolve, reject) => {
     const proc = spawn("yt-dlp", [
@@ -194,10 +231,31 @@ async function downloadTikTok(url, destDir) {
   });
 }
 
-async function sendTikTokVideoLocally(sourceUrl, targetChatId) {
+// knownDirectUrl — если уже резолвили через tikwm раньше (например, при
+// первой попытке "дать ссылку Telegram'у"), не резолвим второй раз, а сразу
+// пробуем скачать её сами; если и это не вышло — честный yt-dlp с нуля.
+async function downloadTikTok(url, destDir, knownDirectUrl = null) {
+  if (knownDirectUrl) {
+    try {
+      return await downloadFromUrl(knownDirectUrl, path.join(destDir, "video.mp4"));
+    } catch (err) {
+      console.warn("Не вышло скачать по прямой ссылке tikwm, пробую yt-dlp:", err.message || err);
+    }
+  } else {
+    try {
+      const info = await getTikTokDirectInfoTikwm(url);
+      return await downloadFromUrl(info.directUrl, path.join(destDir, "video.mp4"));
+    } catch (err) {
+      console.warn("tikwm не помог со скачиванием, пробую yt-dlp:", err.message || err);
+    }
+  }
+  return downloadTikTokYtDlp(url, destDir);
+}
+
+async function sendTikTokVideoLocally(sourceUrl, targetChatId, knownDirectUrl = null) {
   const tmpDir = await mkdtemp(path.join(tmpdir(), "ttvideo-"));
   try {
-    const filePath = await downloadTikTok(sourceUrl, tmpDir);
+    const filePath = await downloadTikTok(sourceUrl, tmpDir, knownDirectUrl);
     const { size } = await stat(filePath);
     if (size > MAX_UPLOAD_BYTES) {
       throw new Error(
@@ -355,13 +413,33 @@ async function searchDeezerTracks(query, limit = 8) {
   }));
 }
 
-function buildDeezerDownloadUrl(meta, format) {
-  const params = new URLSearchParams({ id: meta.id, format, arl: DEEZER_ARL });
+function buildDeezerParams(meta, format, extra = {}) {
+  const params = new URLSearchParams({ id: meta.id, format, arl: DEEZER_ARL, ...extra });
   if (meta.title) params.set("title", meta.title);
   if (meta.performer) params.set("performer", meta.performer);
   if (meta.album) params.set("album", meta.album);
   if (meta.coverUrl) params.set("cover_url", meta.coverUrl);
-  return `${DEEZER_API_URL}/download?${params.toString()}`;
+  return params;
+}
+
+// /stream (в отличие от /download) сначала проверяет прогретый CDN-кэш и умеет
+// отдавать файл потоком с поддержкой Range — именно эту ссылку нужно давать
+// Telegram'у напрямую, иначе он не дождётся первого байта и упадёт с 400.
+function buildDeezerStreamUrl(meta, format) {
+  return `${DEEZER_API_URL}/stream?${buildDeezerParams(meta, format).toString()}`;
+}
+
+// Просит dzmedia заранее резолвнуть и закэшировать CDN-ссылку (см. /warm на
+// сервере), пока пользователь ещё выбирает канал — чтобы к моменту, когда
+// Telegram полезет за файлом по /stream, кэш был уже тёплым. Best-effort:
+// ошибку тут проглатываем, /stream в любом случае справится сам, просто
+// медленнее.
+function warmDeezerTrack(meta, format) {
+  if (!DEEZER_ENABLED) return;
+  const url = `${DEEZER_API_URL}/warm?${buildDeezerParams(meta, format).toString()}`;
+  fetch(url).catch((err) => {
+    console.warn("Не удалось прогреть кэш dzmedia:", err.message || err);
+  });
 }
 
 // Скачивает расшифрованный трек через dzmedia /download на диск бота —
@@ -376,7 +454,7 @@ async function downloadDeezerTrack(meta, destDir, format) {
   const timer = setTimeout(() => controller.abort(), 120_000); // decrypt на сервере может занять время
   let res;
   try {
-    res = await fetch(buildDeezerDownloadUrl(meta, format), { signal: controller.signal });
+    res = await fetch(buildDeezerStreamUrl(meta, format), { signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -461,9 +539,10 @@ async function offerDeezerTrack(ctx, meta, statusMsg) {
   await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
 
   if (route === "url") {
+    warmDeezerTrack(meta, format); // greет кэш в фоне, пока юзер жмёт кнопку канала
     await offerChannelChoice(ctx, {
       kind: "audio-url",
-      url: buildDeezerDownloadUrl(meta, format),
+      url: buildDeezerStreamUrl(meta, format),
       meta,
       format,
     });
@@ -622,7 +701,7 @@ async function handleTikTokLink(ctx, url) {
   await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, "скачиваю…").catch(() => {});
   const tmpDir = await mkdtemp(path.join(tmpdir(), "ttvideo-"));
   try {
-    const filePath = await downloadTikTok(url, tmpDir);
+    const filePath = await downloadTikTok(url, tmpDir, info?.directUrl || null);
     const { size } = await stat(filePath);
     if (size > MAX_UPLOAD_BYTES) {
       await ctx.api.editMessageText(
@@ -753,7 +832,7 @@ bot.on("callback_query:data", async (ctx) => {
         await bot.api.sendVideo(targetChatId, pending.url);
       } catch (err) {
         console.warn("Telegram не смог скачать видео по ссылке, качаю сам:", err.message || err);
-        await sendTikTokVideoLocally(pending.sourceUrl, targetChatId);
+        await sendTikTokVideoLocally(pending.sourceUrl, targetChatId, pending.url);
       }
     } else if (pending.filePath) {
       await bot.api.sendVideo(targetChatId, new InputFile(pending.filePath));
