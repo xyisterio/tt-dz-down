@@ -48,6 +48,14 @@ const OWNER_ID = Number(process.env.OWNER_ID);
 if (!BOT_TOKEN) throw new Error("Нужен BOT_TOKEN в переменных окружения");
 if (!OWNER_ID) throw new Error("Нужен OWNER_ID (числовой Telegram id хозяина) в переменных окружения");
 
+// Автомаршрутизация по типу контента: видео — в один канал, музыка — в
+// другой, без запроса подтверждения. Chat id каналов узнать через
+// /channels (после регистрации обычным способом — админом или форвардом).
+// Если какой-то из id не задан — для этого типа контента бот вернётся
+// к старому поведению и спросит канал кнопками.
+const VIDEO_CHANNEL_ID = process.env.VIDEO_CHANNEL_ID ? Number(process.env.VIDEO_CHANNEL_ID) : null;
+const MUSIC_CHANNEL_ID = process.env.MUSIC_CHANNEL_ID ? Number(process.env.MUSIC_CHANNEL_ID) : null;
+
 // Redis.fromEnv() сам берёт UPSTASH_REDIS_REST_URL и UPSTASH_REDIS_REST_TOKEN.
 // Без них бот тоже работает, просто список каналов и выбранное качество
 // не переживут рестарт — для хобби-проекта на бесплатном Render это не
@@ -281,7 +289,13 @@ async function sendTikTokVideoLocally(sourceUrl, targetChatId, knownDirectUrl = 
 // DEEZER_SEND_AUDIO_TIMEOUT_MS — сколько ждать ответа от /send_audio
 //   dzmedia-сервера (он сам скачивает, тегирует и грузит трек в Telegram —
 //   это может занять время), по умолчанию 60 секунд.
-const DEEZER_API_URL = (process.env.DEEZER_API_URL || "").replace(/\/+$/, "");
+// Разрешаем указать DEEZER_API_URL без схемы (например, просто
+// "127.0.0.1:8080") — fetch/undici такое не примет ("Failed to parse URL"),
+// поэтому молча подставляем http://, если схемы нет.
+const RAW_DEEZER_API_URL = (process.env.DEEZER_API_URL || "").replace(/\/+$/, "");
+const DEEZER_API_URL = RAW_DEEZER_API_URL && !/^https?:\/\//i.test(RAW_DEEZER_API_URL)
+  ? `http://${RAW_DEEZER_API_URL}`
+  : RAW_DEEZER_API_URL;
 const DEEZER_ARL = process.env.DEEZER_ARL || "";
 const DEEZER_ENABLED = Boolean(DEEZER_API_URL && DEEZER_ARL);
 const DEEZER_SEND_AUDIO_TIMEOUT_MS = Number(process.env.DEEZER_SEND_AUDIO_TIMEOUT_MS || 60_000);
@@ -539,7 +553,7 @@ async function offerDeezerTrack(ctx, meta, statusMsg) {
   // (downloadDeezerTrack, использует /stream), кэш уже будет тёплым.
   warmDeezerTrack(meta, format);
 
-  await offerChannelChoice(ctx, {
+  await autoSend(ctx, {
     kind: "audio-big",
     meta,
     format,
@@ -615,6 +629,74 @@ async function offerChannelChoice(ctx, payload) {
   await ctx.reply("куда отправить?", { reply_markup: buildChannelKeyboard() });
 }
 
+// Музыка (Deezer) или видео (TikTok/присланный файл) — по kind.
+function mediaCategory(kind) {
+  return kind === "audio-big" || kind === "audio-url" ? "audio" : "video";
+}
+
+function resolveAutoTarget(kind) {
+  return mediaCategory(kind) === "audio" ? MUSIC_CHANNEL_ID : VIDEO_CHANNEL_ID;
+}
+
+// Собственно отправка уже выбранного файла в конкретный канал — вынесено
+// отдельно, чтобы использовать и в автоматическом режиме, и в старом
+// ручном (кнопки), если целевой канал для этого типа контента не настроен.
+async function deliverPending(pending, targetChatId) {
+  if (pending.kind === "audio-big") {
+    await sendBigDeezerTrack(pending.meta, pending.format, targetChatId);
+  } else if (pending.kind === "audio-url") {
+    try {
+      await bot.api.sendAudio(targetChatId, pending.url, {
+        title: pending.meta.title || undefined,
+        performer: pending.meta.performer || undefined,
+        duration: pending.meta.duration || undefined,
+      });
+    } catch (err) {
+      console.warn("Telegram не смог скачать трек по ссылке, качаю сам:", err.message || err);
+      await sendDeezerTrackLocally(pending.meta, pending.format, targetChatId);
+    }
+  } else if (pending.kind === "video-url") {
+    try {
+      await bot.api.sendVideo(targetChatId, pending.url);
+    } catch (err) {
+      console.warn("Telegram не смог скачать видео по ссылке, качаю сам:", err.message || err);
+      await sendTikTokVideoLocally(pending.sourceUrl, targetChatId, pending.url);
+    }
+  } else if (pending.filePath) {
+    await bot.api.sendVideo(targetChatId, new InputFile(pending.filePath));
+  } else if (pending.kind === "video") {
+    await bot.api.sendVideo(targetChatId, pending.fileId);
+  } else if (pending.kind === "animation") {
+    await bot.api.sendAnimation(targetChatId, pending.fileId);
+  } else {
+    await bot.api.sendDocument(targetChatId, pending.fileId);
+  }
+}
+
+// Если канал для этого типа контента настроен через VIDEO_CHANNEL_ID /
+// MUSIC_CHANNEL_ID — отправляем сразу, без вопросов. Иначе — как раньше,
+// предлагаем выбрать канал кнопками (на случай, если завести отдельные
+// каналы под музыку и видео ещё не успел / не хочет).
+async function autoSend(ctx, payload) {
+  const targetChatId = resolveAutoTarget(payload.kind);
+  if (!targetChatId) {
+    await offerChannelChoice(ctx, payload);
+    return;
+  }
+  const targetTitle = channels.get(targetChatId) || String(targetChatId);
+  try {
+    await deliverPending(payload, targetChatId);
+    await ctx.reply(`отправлено в «${targetTitle}»`);
+  } catch (err) {
+    console.error("Не удалось отправить в канал:", err);
+    await ctx.reply(`не вышло отправить в «${targetTitle}»: ${err.message || err}`);
+  } finally {
+    if (payload.filePath) {
+      await rm(path.dirname(payload.filePath), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
 // ---- Команды и хендлеры ----
 
 bot.command("start", async (ctx) => {
@@ -665,7 +747,7 @@ bot.on(["message:video", "message:animation", "message:document"], async (ctx) =
 
   const fileId = ctx.message.video?.file_id || ctx.message.animation?.file_id || ctx.message.document?.file_id;
   const kind = ctx.message.video ? "video" : ctx.message.animation ? "animation" : "document";
-  await offerChannelChoice(ctx, { fileId, kind });
+  await autoSend(ctx, { fileId, kind });
 });
 
 // Пытаемся получить прямую ссылку на видео без скачивания. Если её размер
@@ -684,7 +766,7 @@ async function handleTikTokLink(ctx, url) {
 
   if (info?.directUrl && info.filesize && info.filesize <= TELEGRAM_URL_FETCH_LIMIT_BYTES) {
     await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-    await offerChannelChoice(ctx, { kind: "video-url", url: info.directUrl, sourceUrl: url });
+    await autoSend(ctx, { kind: "video-url", url: info.directUrl, sourceUrl: url });
     return;
   }
 
@@ -703,7 +785,7 @@ async function handleTikTokLink(ctx, url) {
       return;
     }
     await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-    await offerChannelChoice(ctx, { filePath, kind: "video" });
+    await autoSend(ctx, { filePath, kind: "video" });
   } catch (err) {
     console.error("Не удалось скачать TikTok-видео:", err);
     await ctx.api.editMessageText(
@@ -808,38 +890,7 @@ bot.on("callback_query:data", async (ctx) => {
   const targetTitle = channels.get(targetChatId) || String(targetChatId);
 
   try {
-    if (pending.kind === "audio-big") {
-      // dzmedia сам качает/тегирует/грузит трек в Telegram по chat_id.
-      await sendBigDeezerTrack(pending.meta, pending.format, targetChatId);
-    } else if (pending.kind === "audio-url") {
-      // Даём Telegram'у ссылку на dzmedia /download — он скачает сам.
-      try {
-        await bot.api.sendAudio(targetChatId, pending.url, {
-          title: pending.meta.title || undefined,
-          performer: pending.meta.performer || undefined,
-          duration: pending.meta.duration || undefined,
-        });
-      } catch (err) {
-        console.warn("Telegram не смог скачать трек по ссылке, качаю сам:", err.message || err);
-        await sendDeezerTrackLocally(pending.meta, pending.format, targetChatId);
-      }
-    } else if (pending.kind === "video-url") {
-      // Даём Telegram'у прямую ссылку на TikTok CDN — он скачает сам.
-      try {
-        await bot.api.sendVideo(targetChatId, pending.url);
-      } catch (err) {
-        console.warn("Telegram не смог скачать видео по ссылке, качаю сам:", err.message || err);
-        await sendTikTokVideoLocally(pending.sourceUrl, targetChatId, pending.url);
-      }
-    } else if (pending.filePath) {
-      await bot.api.sendVideo(targetChatId, new InputFile(pending.filePath));
-    } else if (pending.kind === "video") {
-      await bot.api.sendVideo(targetChatId, pending.fileId);
-    } else if (pending.kind === "animation") {
-      await bot.api.sendAnimation(targetChatId, pending.fileId);
-    } else {
-      await bot.api.sendDocument(targetChatId, pending.fileId);
-    }
+    await deliverPending(pending, targetChatId);
     await ctx.editMessageText(`отправлено в «${targetTitle}»`);
   } catch (err) {
     console.error("Не удалось отправить в канал:", err);
