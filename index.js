@@ -423,10 +423,22 @@ function buildDeezerParams(meta, format, extra = {}) {
 }
 
 // /stream (в отличие от /download) сначала проверяет прогретый CDN-кэш и умеет
-// отдавать файл потоком с поддержкой Range — именно эту ссылку нужно давать
-// Telegram'у напрямую, иначе он не дождётся первого байта и упадёт с 400.
+// отдавать файл потоком с поддержкой Range. Используется только для
+// подстраховочного локального скачивания (downloadDeezerTrack) — туда,
+// где нужна отдача частями, а не для прямой ссылки для Telegram (см.
+// buildDeezerDownloadUrl ниже).
 function buildDeezerStreamUrl(meta, format) {
   return `${DEEZER_API_URL}/stream?${buildDeezerParams(meta, format).toString()}`;
+}
+
+// /download отдаёт уже полностью расшифрованный файл одним ответом — сразу
+// с правильным Content-Type (audio/mpeg или audio/flac, определяется по
+// магическим байтам после расшифровки, а не пробрасывается от CDN как в
+// /stream) и точным Content-Length. Именно этого и ждёт Telegram, когда мы
+// даём ему ссылку и просим скачать самому — так же было устроено на
+// HuggingFace-сервере, откуда это и звалось без проблем.
+function buildDeezerDownloadUrl(meta, format) {
+  return `${DEEZER_API_URL}/download?${buildDeezerParams(meta, format).toString()}`;
 }
 
 // Просит dzmedia заранее резолвнуть и закэшировать CDN-ссылку (см. /warm на
@@ -539,10 +551,14 @@ async function offerDeezerTrack(ctx, meta, statusMsg) {
   await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
 
   if (route === "url") {
-    warmDeezerTrack(meta, format); // greет кэш в фоне, пока юзер жмёт кнопку канала
+    // /download не смотрит в кэш /warm (он только для /stream) и резолвит
+    // CDN-ссылку заново при каждом запросе — но /stream всё ещё в деле как
+    // локальный фоллбэк (downloadDeezerTrack), если Telegram не осилит
+    // /download-ссылку сам. Поэтому греем кэш заранее — на случай фоллбэка.
+    warmDeezerTrack(meta, format);
     await offerChannelChoice(ctx, {
       kind: "audio-url",
-      url: buildDeezerStreamUrl(meta, format),
+      url: buildDeezerDownloadUrl(meta, format),
       meta,
       format,
     });
@@ -807,6 +823,13 @@ bot.on("callback_query:data", async (ctx) => {
   }
   pendingSend.delete(ctx.from.id);
 
+  // Отвечаем на callback сразу, не дожидаясь отправки: скачивание/загрузка
+  // файла (особенно локальный фоллбэк) может занять дольше, чем Telegram
+  // готов ждать ответа на callback_query, и тогда answerCallbackQuery падает
+  // с "query is too old" — раньше это происходило уже в catch-блоке ниже,
+  // без обработчика ошибок бота, и роняло весь процесс.
+  await ctx.answerCallbackQuery().catch(() => {});
+
   const targetChatId = Number(data.slice("sendto:".length));
   const targetTitle = channels.get(targetChatId) || String(targetChatId);
 
@@ -844,10 +867,9 @@ bot.on("callback_query:data", async (ctx) => {
       await bot.api.sendDocument(targetChatId, pending.fileId);
     }
     await ctx.editMessageText(`отправлено в «${targetTitle}»`);
-    await ctx.answerCallbackQuery({ text: "готово" });
   } catch (err) {
     console.error("Не удалось отправить в канал:", err);
-    await ctx.answerCallbackQuery({ text: "не вышло отправить, см. логи", show_alert: true });
+    await ctx.editMessageText(`не вышло отправить в «${targetTitle}», см. логи`).catch(() => {});
   } finally {
     if (pending.filePath) {
       await rm(path.dirname(pending.filePath), { recursive: true, force: true }).catch(() => {});
@@ -886,6 +908,13 @@ async function main() {
     }`
   );
   startHealthCheckServer();
+  // Без этого обработчика любая необработанная ошибка в middleware (даже
+  // безобидная вроде просроченного callback_query) валит весь процесс —
+  // grammY прокидывает её как unhandled rejection, а Node.js завершает работу.
+  bot.catch((err) => {
+    console.error(`Ошибка при обработке update ${err.ctx?.update?.update_id}:`, err.error || err);
+  });
+
   bot.start();
 }
 
