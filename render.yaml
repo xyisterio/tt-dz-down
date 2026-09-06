@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: tiktok-relay-bot
+    env: docker
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: DEEZER_API_URL
+        sync: false
+      - key: DEEZER_ARL
+        sync: false
+      - key: DEEZER_FORMAT
+        sync: false

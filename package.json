@@ -1,0 +1,17 @@
+{
+  "name": "tiktok-relay-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.0",
+    "grammy": "^1.30.0"
+  }
+}
