@@ -1,3 +1,8 @@
+FROM rust:latest AS dzmedia-builder
+WORKDIR /usr/src/dzmedia
+COPY dzmedia-src/ .
+RUN cargo build --release && mv ./target/release/dzmedia ./dzmedia
+
 FROM node:20-slim
 
 # ADD с URL инвалидирует кэш слоя сам, когда меняется содержимое ответа —
@@ -25,4 +30,9 @@ COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 COPY . .
 
-CMD ["node", "index.js"]
+# Скомпилированный dzmedia — кладём рядом с ботом. Живёт на 127.0.0.1:8080,
+# наружу не торчит, см. entrypoint.sh.
+COPY --from=dzmedia-builder /usr/src/dzmedia/dzmedia ./dzmedia-bin
+RUN chmod +x ./dzmedia-bin entrypoint.sh
+
+CMD ["./entrypoint.sh"]
