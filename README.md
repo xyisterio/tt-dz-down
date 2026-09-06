@@ -55,9 +55,21 @@
 
 1. Залей эту папку в свой GitHub-репозиторий.
 2. На Render: **New → Blueprint**, укажи репозиторий — подхватит
-   `render.yaml` автоматически (тип сервиса — worker, без HTTP-порта,
-   long polling).
-3. В настройках сервиса задай переменные окружения:
+   `render.yaml` автоматически.
+3. Тип сервиса в `render.yaml` — `web`, а не `worker`: у Render просто нет
+   бесплатного плана для Background Worker (только Web Service, Static
+   Site, Postgres и Redis). Поэтому бот сам поднимает внутри процесса
+   крошечный HTTP-сервер на `$PORT`, который только отвечает "ok" —
+   это нужно исключительно чтобы Render увидел открытый порт и не писал
+   в логи "No open ports detected". На саму работу бота (long polling,
+   без вебхука) это не влияет.
+4. Бесплатный Web Service на Render "засыпает" после ~15 минут без
+   HTTP-запросов и потом отвечает на них с задержкой в холодный старт —
+   но long polling к боту это не касается, спать он не будет, пока сам
+   процесс жив. Если Render всё же остановит инстанс из-за неактивности,
+   можно раз в несколько минут дёргать его health-check URL (например,
+   через UptimeRobot / cron-job.org), чтобы он не засыпал.
+5. В настройках сервиса задай переменные окружения:
    - `BOT_TOKEN` — токен от @BotFather;
    - `OWNER_ID` — твой числовой Telegram id;
    - `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` —
@@ -66,7 +78,7 @@
    - `DEEZER_API_URL` / `DEEZER_ARL` (+ опционально `DEEZER_FORMAT`,
      `DEEZER_SEND_AUDIO_TIMEOUT_MS`) — для поддержки Deezer; без них бот
      работает только с TikTok.
-4. Деплой соберёт Docker-образ с Node.js + `yt-dlp` + `ffmpeg` и запустит
+6. Деплой соберёт Docker-образ с Node.js + `yt-dlp` + `ffmpeg` и запустит
    бота через long polling — вебхук не нужен.
 
 ## Ограничения

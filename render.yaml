@@ -1,5 +1,9 @@
 services:
-  - type: worker
+  # У Render нет бесплатного плана для type: worker (только Web Service,
+  # Static Site, Postgres, Redis). Поэтому деплоим как web — бот сам
+  # поднимает health-check сервер на $PORT (см. index.js), а работает
+  # как обычно через long polling, вебхук не нужен.
+  - type: web
     name: tiktok-relay-bot
     env: docker
     plan: free

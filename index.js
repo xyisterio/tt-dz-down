@@ -40,6 +40,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import http from "node:http";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_ID = Number(process.env.OWNER_ID);
@@ -775,6 +776,23 @@ bot.on("callback_query:data", async (ctx) => {
   }
 });
 
+// Render бесплатно даёт только тип "Web Service", а не "Background Worker" —
+// у него free-плана вообще нет. Чтобы деплоиться бесплатно, сервис должен
+// притворяться веб-сервисом: открыть порт, который Render сканирует при
+// старте. Сам бот при этом как работал через long polling, так и работает —
+// этот сервер только отвечает "ok" на любой запрос, для health-check'ов.
+function startHealthCheckServer() {
+  const port = process.env.PORT || 10000;
+  http
+    .createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("ok");
+    })
+    .listen(port, () => {
+      console.log(`Health-check сервер слушает порт ${port} (для бесплатного Render Web Service)`);
+    });
+}
+
 async function main() {
   await loadChannels();
   await loadDeezerFormat();
@@ -788,6 +806,7 @@ async function main() {
       DEEZER_ENABLED ? "" : " (Deezer выключен)"
     }`
   );
+  startHealthCheckServer();
   bot.start();
 }
 
