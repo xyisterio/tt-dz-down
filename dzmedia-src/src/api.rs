@@ -53,6 +53,32 @@ pub enum APIError {
     JSON(#[from] serde_json::error::Error)
 }
 
+// Некоторые треки на Deezer лицензированы не глобально, а только для
+// определённых стран — и это проверяется по IP, с которого идёт запрос к
+// media.deezer.com/v1/get_url (и к самому gw-light.php), а не по стране
+// аккаунта. Если сервер задеплоен там, где конкретный трек не лицензирован
+// (частый случай — Германия из-за GEMA), media.getUrl молча вернёт пустой
+// список media при 200 OK — сам трек при этом прекрасно стримится для того
+// же аккаунта из другой страны.
+//
+// DEEZER_PROXY — необязательный прокси (http://, https:// или socks5://,
+// можно с логином/паролем в URL) в стране, где нужные треки разрешены —
+// обычно любая другая страна ЕС (France, Netherlands…) уже решает проблему.
+// Без переменной поведение не меняется — прокси не используется.
+fn apply_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    match std::env::var("DEEZER_PROXY").ok().filter(|s| !s.trim().is_empty()) {
+        Some(proxy_url) => match reqwest::Proxy::all(proxy_url.trim()) {
+            Ok(proxy) => builder.proxy(proxy),
+            Err(e) => {
+                tracing::error!("DEEZER_PROXY задан, но не распарсился ({e}) — работаю без прокси");
+                builder = builder.no_proxy();
+                builder
+            }
+        },
+        None => builder.no_proxy(),
+    }
+}
+
 #[derive(Clone)]
 pub struct APIClient {
     client: Client,
@@ -66,8 +92,7 @@ impl APIClient {
         match env::var("ARL") {
             Ok(arl) if !arl.trim().is_empty() => Self::new_with_arl(arl),
             _ => Self {
-                client: Client::builder()
-                    .no_proxy()
+                client: apply_proxy(Client::builder())
                     .connect_timeout(Duration::from_secs(5))
                     .timeout(Duration::from_secs(12))
                     .build()
@@ -88,7 +113,7 @@ impl APIClient {
         check_form: String,
         license_token: String,
     ) -> Self {
-        let builder = Client::builder().no_proxy();
+        let builder = apply_proxy(Client::builder());
 
         let cookie = format!("arl={}; Domain=.deezer.com; Path=/", arl);
         let comeback = "comeback=1; Domain=.deezer.com; Path=/";

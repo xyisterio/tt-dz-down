@@ -350,7 +350,7 @@ async fn media_url_for_track(
         }
     }
 
-    let q_json = serde_json::json!({"sng_ids":[id],"array_default":["SNG_ID","TRACK_TOKEN","FALLBACK"]});
+    let q_json = serde_json::json!({"sng_ids":[id],"array_default":["SNG_ID","TRACK_TOKEN","FALLBACK","AVAILABLE_COUNTRIES"]});
     let r: serde_json::Value = client.api_call("song.getListData", &q_json).await.map_err(|e| {
         let _ = writeln!(log_file, "api_call err: {}", e);
         e.to_string()
@@ -373,13 +373,31 @@ async fn media_url_for_track(
         })
     }).unwrap_or(0);
 
-    let _ = writeln!(log_file, "track_token: {}, fallback_id: {}, fallback_token: {}", track_token, fallback_id, fallback_token);
+    // AVAILABLE_COUNTRIES обычно вида {"stream": ["FR","NL",...], ...} — список
+    // ISO-кодов стран, где у трека есть права на конкретное действие (право
+    // "stream" — то самое, от которого зависит media.getUrl). Если сюда не
+    // входит страна, откуда идёт запрос — media.getUrl молча вернёт пустой
+    // media, что бы мы ни делали. Значение пишем в лог как есть, включая
+    // fallback-варианты ниже, чтобы не гадать, а сразу увидеть список стран.
+    let _ = writeln!(
+        log_file,
+        "track_token: {}, fallback_id: {}, fallback_token: {}, available_countries: {}",
+        track_token,
+        fallback_id,
+        fallback_token,
+        item.get("AVAILABLE_COUNTRIES").map(|v| v.to_string()).unwrap_or_else(|| "<нет поля>".to_string())
+    );
 
     if fallback_id > 0 {
-        let q_fb = serde_json::json!({"sng_ids":[fallback_id],"array_default":["SNG_ID","TRACK_TOKEN","FALLBACK"]});
+        let q_fb = serde_json::json!({"sng_ids":[fallback_id],"array_default":["SNG_ID","TRACK_TOKEN","FALLBACK","AVAILABLE_COUNTRIES"]});
         let _ = writeln!(log_file, "Querying fallback ID: {}", fallback_id);
         if let Ok(r_fb) = client.api_call::<serde_json::Value, serde_json::Value>("song.getListData", &q_fb).await {
             if let Some(item_fb) = r_fb.pointer("/data/0") {
+                let _ = writeln!(
+                    log_file,
+                    "fallback available_countries: {}",
+                    item_fb.get("AVAILABLE_COUNTRIES").map(|v| v.to_string()).unwrap_or_else(|| "<нет поля>".to_string())
+                );
                 if let Some(real_tk) = item_fb.get("TRACK_TOKEN").and_then(|v| v.as_str()) {
                     let _ = writeln!(log_file, "Fetched real_tk for fallback: {}", real_tk);
                     let tokens = vec![real_tk];
