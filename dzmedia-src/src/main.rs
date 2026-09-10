@@ -350,6 +350,27 @@ async fn media_url_for_track(
         }
     }
 
+    // Диагностика: отдельным запросом БЕЗ array_default (то есть без
+    // урезания полей вообще) получаем полный объект трека и валим его в лог
+    // целиком — чтобы увидеть реальные имена полей вместо угадывания.
+    // array_default в gw-light API — это whitelist полей, и если нужного
+    // поля в нём нет (или оно называется иначе/вычисляется только в полном
+    // ответе), оно просто тихо не попадёт в отфильтрованный ответ ниже.
+    let q_full = serde_json::json!({"sng_ids":[id]});
+    match client.api_call::<serde_json::Value, serde_json::Value>("song.getListData", &q_full).await {
+        Ok(full) => match full.pointer("/data/0") {
+            Some(full_item) => {
+                let _ = writeln!(log_file, "FULL TRACK OBJECT (no array_default): {}", full_item);
+            }
+            None => {
+                let _ = writeln!(log_file, "FULL TRACK OBJECT: data/0 отсутствует, ответ: {}", full);
+            }
+        },
+        Err(e) => {
+            let _ = writeln!(log_file, "FULL TRACK OBJECT: запрос без array_default не удался: {}", e);
+        }
+    }
+
     let q_json = serde_json::json!({"sng_ids":[id],"array_default":["SNG_ID","TRACK_TOKEN","FALLBACK","AVAILABLE_COUNTRIES"]});
     let r: serde_json::Value = client.api_call("song.getListData", &q_json).await.map_err(|e| {
         let _ = writeln!(log_file, "api_call err: {}", e);
