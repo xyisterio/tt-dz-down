@@ -907,10 +907,38 @@ bot.on("callback_query:data", async (ctx) => {
 // притворяться веб-сервисом: открыть порт, который Render сканирует при
 // старте. Сам бот при этом как работал через long polling, так и работает —
 // этот сервер только отвечает "ok" на любой запрос, для health-check'ов.
+//
+// Единственное исключение — /debug_log: dzmedia слушает только 127.0.0.1
+// и наружу не торчит специально (там крутится ARL), так что его /debug_log
+// снаружи недостижим. Тут прокидываем именно этот один путь внутрь, и то
+// только если задан DEBUG_PROXY_KEY и он совпадает с ?key= в запросе —
+// без переменной путь ведёт себя как любой другой, просто отвечает "ok".
 function startHealthCheckServer() {
   const port = process.env.PORT || 10000;
+  const debugProxyKey = process.env.DEBUG_PROXY_KEY || "";
+
   http
-    .createServer((_req, res) => {
+    .createServer(async (req, res) => {
+      const url = new URL(req.url, "http://localhost");
+
+      if (url.pathname === "/debug_log") {
+        if (!debugProxyKey || url.searchParams.get("key") !== debugProxyKey) {
+          res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end("not found");
+          return;
+        }
+        try {
+          const upstream = await fetch("http://127.0.0.1:8080/debug_log");
+          const text = await upstream.text();
+          res.writeHead(upstream.status, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end(text);
+        } catch (err) {
+          res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end(`dzmedia недоступен: ${err.message || err}`);
+        }
+        return;
+      }
+
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("ok");
     })
