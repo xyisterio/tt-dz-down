@@ -22,3 +22,5 @@ services:
         sync: false
       - key: DEEZER_FORMAT
         sync: false
+      - key: DEEZER_PROXY
+        sync: false
